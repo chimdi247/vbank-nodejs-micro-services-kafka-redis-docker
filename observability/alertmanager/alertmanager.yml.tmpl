@@ -1,0 +1,38 @@
+# Rendered by entrypoint.sh (values come from SMTP_* / ALERT_EMAIL_* in .env) into
+# /tmp/alertmanager.yml at container start.
+global:
+  smtp_smarthost: '__SMTP_HOST__:__SMTP_PORT__'
+  smtp_from: '__SMTP_FROM__'
+  smtp_auth_username: '__SMTP_USER__'
+  smtp_auth_password_file: /tmp/smtp_password
+  smtp_require_tls: __SMTP_REQUIRE_TLS__
+  resolve_timeout: 5m
+
+route:
+  receiver: email-alerts
+  group_by: [alertname, name, service]
+  group_wait: 20s
+  group_interval: 2m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: email-alerts
+      repeat_interval: 1h
+
+receivers:
+  - name: email-alerts
+    email_configs:
+      - to: '__ALERT_EMAIL_TO__'
+        send_resolved: true
+        headers:
+          subject: '[VBank][{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        html: |
+          <h3>{{ .Status | toUpper }}: {{ .CommonLabels.alertname }}</h3>
+          {{ range .Alerts }}
+          <p>
+            <b>{{ .Annotations.summary }}</b><br/>
+            {{ .Annotations.description }}<br/>
+            <small>severity: {{ .Labels.severity }} &middot; started: {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }}</small>
+          </p>
+          {{ end }}
+          <p><a href="__GRAFANA_URL__">Open Grafana</a></p>

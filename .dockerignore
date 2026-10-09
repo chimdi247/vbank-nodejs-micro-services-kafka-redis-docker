@@ -1,0 +1,17 @@
+# build context is the repo root for the backend images, keep it small and clean
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.idea
+.vscode
+frontend
+observability
+docker
+e2e-tests
+_bruno
+assets
+*.md
+*.tgz

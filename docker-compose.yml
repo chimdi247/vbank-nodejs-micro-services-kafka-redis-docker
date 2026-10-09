@@ -1,0 +1,534 @@
+# =============================================================================
+# VBank - the whole platform with one command:
+#
+#     docker compose up -d --build
+#
+#   App                 http://localhost:5173   login: admin@example.com / password123
+#   API gateway         http://localhost:3000
+#   Kafka UI            http://localhost:8080
+#   Redis UI            http://localhost:8081
+#   Grafana             http://localhost:3030   login: admin / admin   (VBank folder)
+#   Prometheus          http://localhost:9090
+#   Alertmanager        http://localhost:9093
+#   Mailpit (alert inbox) http://localhost:8025
+#   cAdvisor            http://localhost:8082
+#
+# Performance tests (k6):  ./tests/run.sh smoke | load | stress | spike | soak | breakpoint | saga-latency
+#
+# Every tunable has a default here; copy .env.example to .env to override.
+# Reset everything (databases, dashboards' data, topics):  docker compose down -v
+# =============================================================================
+name: vbank
+
+# ---- shared blocks ----------------------------------------------------------
+x-otel-env: &otel-env
+  # OpenTelemetry auto-instrumentation (loaded with `node --require` in every Dockerfile).
+  # Traces, metrics and logs are pushed to the collector, which routes them to Tempo,
+  # Prometheus and Loki.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  OTEL_PROPAGATORS: tracecontext,baggage
+  OTEL_NODE_RESOURCE_DETECTORS: env,host,os,process
+  OTEL_NODE_ENABLED_INSTRUMENTATIONS: http,undici,express,pg,ioredis,kafkajs,winston
+  # emit both old (http.status_code) and new (http.response.status_code) HTTP attributes
+  OTEL_SEMCONV_STABILITY_OPT_IN: http/dup
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  PORT: "3000"
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-cantremember}@postgres:5432/${POSTGRES_DB:-vbank}
+  REDIS_URL: redis://:${REDIS_PASSWORD:-cantremember}@redis:6379
+  KAFKA_BROKER: kafka:9092
+  JWT_SECRET: ${JWT_SECRET:-01aee198bd1475f54ba9fbc7663430a8e659d8755b550fcb322008f0f66d3719}
+  JWT_EXPIRES_IN: 24h
+  # tables are created by docker/postgres/01-schema.sql
+  DB_SYNCHRONIZE: "false"
+
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  kafka:
+    condition: service_healthy
+  kafka-init:
+    condition: service_completed_successfully
+  otel-collector:
+    condition: service_started
+
+x-node-limits: &node-limits
+  # limits make the "CPU/memory above 50 %" alerts meaningful: they are measured against these
+  resources:
+    limits:
+      cpus: "0.50"
+      memory: 512M
+
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health >/dev/null || exit 1"]
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 25s
+
+services:
+  # ===========================================================================
+  # Data stores and messaging
+  # ===========================================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cantremember}
+      POSTGRES_DB: ${POSTGRES_DB:-vbank}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # *.sql / *.sh in here run once, in name order, on the first start with an empty volume:
+      #   01-schema.sql  02-seed-admin-user.sql  03-seed-demo-data.sql
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-vbank}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-cantremember}", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-cantremember}
+
+  redis-ui:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-ui
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: "vbank:redis:6379:0:${REDIS_PASSWORD:-cantremember}"
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  kafka:
+    # the bitnami/kafka versioned tags were removed from Docker Hub; the official Apache image is used instead
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    restart: unless-stopped
+    ports:
+      - "9094:9094"
+    environment:
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      # PLAINTEXT is for containers (kafka:9092), EXTERNAL for tools on your machine (localhost:9094)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    # one-shot job: creates the topics, then exits (see docker/kafka/create-topics.sh)
+    image: apache/kafka:3.9.0
+    container_name: kafka-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "/create-topics.sh"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - ./docker/kafka/create-topics.sh:/create-topics.sh:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: vbank
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ===========================================================================
+  # VBank services
+  # ===========================================================================
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    image: vbank/api-gateway:latest
+    container_name: api-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      <<: [*app-env, *otel-env]
+      OTEL_SERVICE_NAME: api-gateway
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=vbank
+      AUTH_JWT_SECRET: ${JWT_SECRET:-01aee198bd1475f54ba9fbc7663430a8e659d8755b550fcb322008f0f66d3719}
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:-fe48f0fb5e4cf73017302fff292d4863b102937d8d5922474680907a6f16ef17}
+      GATEWAY_JWT_EXPIRES_IN: 1m
+      REDIS_URL: redis://:${REDIS_PASSWORD:-cantremember}@redis:6379
+      RATE_LIMIT_WINDOW: "15"
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-2000}
+      DEFAULT_TIMEOUT: "30000"
+      AUTH_SERVICE_URL: http://auth-service:3000
+      ACCOUNTS_SERVICE_URL: http://account-service:3000
+      TRANSACTION_SERVICE_URL: http://transaction-service:3000
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck: *node-healthcheck
+    deploy: *node-limits
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    image: vbank/auth-service:latest
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      <<: [*app-env, *backend-env, *otel-env]
+      OTEL_SERVICE_NAME: auth-service
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=vbank
+      ALLOWED_ORIGINS: http://34.171.152.81:5173,http://34.171.152.81:3000,http://frontend
+    depends_on: *backend-depends
+    healthcheck: *node-healthcheck
+    deploy: *node-limits
+
+  account-service:
+    build:
+      context: .
+      dockerfile: services/account-service/Dockerfile
+    image: vbank/account-service:latest
+    container_name: account-service
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      <<: [*app-env, *backend-env, *otel-env]
+      OTEL_SERVICE_NAME: account-service
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=vbank
+    depends_on: *backend-depends
+    healthcheck: *node-healthcheck
+    deploy: *node-limits
+
+  transaction-service:
+    build:
+      context: .
+      dockerfile: services/transaction-service/Dockerfile
+    image: vbank/transaction-service:latest
+    container_name: transaction-service
+    restart: unless-stopped
+    ports:
+      - "3003:3000"
+    environment:
+      <<: [*app-env, *backend-env, *otel-env]
+      OTEL_SERVICE_NAME: transaction-service
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=vbank
+      API_KEY: ${TRANSACTION_API_KEY:-j0Mk5X9XH15shhsu5CvSyTqhTBpdzvwj05gBZfXAkyjymLDIrrmFzsPPmn00fI1Y}
+      API_GATEWAY_URL: http://api-gateway:3000
+      ACCOUNT_SERVICE_URL: http://account-service:3000
+      CENTRAL_BANK_API_URL: http://mock-central-bank-service:3000
+      CENTRAL_BANK_API_KEY: ${CENTRAL_BANK_API_KEY:-nQSu21EUS5Xl1yv1hOKqmz3xXRX1p3vokEBDTlL2mXtksu7fCW6bg6g6lDJop9E7}
+    depends_on: *backend-depends
+    healthcheck: *node-healthcheck
+    deploy: *node-limits
+
+  mock-central-bank-service:
+    build:
+      context: .
+      dockerfile: services/mock-central-bank-service/Dockerfile
+    image: vbank/mock-central-bank-service:latest
+    container_name: mock-central-bank-service
+    restart: unless-stopped
+    ports:
+      - "5010:3000"
+    environment:
+      <<: [*app-env, *otel-env]
+      OTEL_SERVICE_NAME: mock-central-bank-service
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=vbank
+      CENTRAL_BANK_API_KEY: ${CENTRAL_BANK_API_KEY:-nQSu21EUS5Xl1yv1hOKqmz3xXRX1p3vokEBDTlL2mXtksu7fCW6bg6g6lDJop9E7}
+      VBANK_API_URL: http://api-gateway:3000
+      VBANK_API_KEY: ${TRANSACTION_API_KEY:-j0Mk5X9XH15shhsu5CvSyTqhTBpdzvwj05gBZfXAkyjymLDIrrmFzsPPmn00fI1Y}
+    depends_on:
+      otel-collector:
+        condition: service_started
+    healthcheck: *node-healthcheck
+    deploy: *node-limits
+
+  frontend:
+    build:
+      context: ./frontend
+    image: vbank/frontend:latest
+    container_name: frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Observability
+  # ===========================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./observability/otel-collector/otel-collector-config.yml:/etc/otelcol/config.yml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - tempo
+      - loki
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    container_name: tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./observability/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+      - --web.enable-remote-write-receiver   # Tempo pushes span metrics here
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: alertmanager
+    restart: unless-stopped
+    # the entrypoint renders alertmanager.yml from the SMTP_* variables, then starts Alertmanager
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    environment:
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      GRAFANA_URL: http://34.171.152.81:3030
+      ALERTMANAGER_URL: http://34.171.152.81:9093
+    volumes:
+      - ./observability/alertmanager/entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro
+      - ./observability/alertmanager/alertmanager.yml.tmpl:/etc/alertmanager/alertmanager.yml.tmpl:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "9093:9093"
+    depends_on:
+      - mailpit
+
+  mailpit:
+    # catch-all SMTP server with a web inbox: alert e-mails can be read without a real mail account
+    image: axllent/mailpit:v1.24
+    container_name: mailpit
+    restart: unless-stopped
+    ports:
+      - "8025:8025"   # web inbox
+      - "1025:1025"   # SMTP
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./observability/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3030:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+      - postgres
+
+  cadvisor:
+    # per-container CPU / memory / network
+    image: ghcr.io/google/cadvisor:0.55.1
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    command: ["--docker_only=true", "--housekeeping_interval=10s"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8082:8080"
+
+  node-exporter:
+    # host (node) CPU / memory / disk / network
+    image: prom/node-exporter:v1.9.0
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+
+  blackbox-exporter:
+    # HTTP /health probes -> uptime and availability SLI
+    image: prom/blackbox-exporter:v0.26.0
+    container_name: blackbox-exporter
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-cantremember}@postgres:5432/${POSTGRES_DB:-vbank}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.69.0
+    container_name: redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-cantremember}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: kafka-exporter
+    restart: unless-stopped
+    command: ["--kafka.server=kafka:9092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Performance tests (not started by `docker compose up`; run with ./tests/run.sh)
+  # ===========================================================================
+  k6:
+    image: grafana/k6:0.57.0
+    profiles: ["tests"]
+    working_dir: /tests
+    environment:
+      # inside the compose network: gateway and the services' own ports
+      BASE_URL: http://api-gateway:3000
+      AUTH_URL: http://auth-service:3000
+      ACCOUNT_URL: http://account-service:3000
+      TRANSACTION_URL: http://transaction-service:3000
+      CENTRAL_BANK_URL: http://mock-central-bank-service:3000
+      # live metrics into Prometheus (remote-write receiver is enabled) -> Grafana "VBank k6 Load Tests"
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 5s
+      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),max,avg
+      K6_PROMETHEUS_RW_STALE_MARKERS: "true"
+    volumes:
+      - ./tests:/tests:ro
+      - ./tests/results:/results
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  grafana_data:
+  alertmanager_data:

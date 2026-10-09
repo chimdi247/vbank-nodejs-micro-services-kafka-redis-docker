@@ -1,0 +1,31 @@
+groups:
+  - name: vbank-resource-usage
+    interval: 15s
+    rules:
+      # CPU used by a container, as a percentage of its CPU limit when one is set
+      # (deploy.resources.limits.cpus), otherwise of all CPU cores of the host.
+      - record: container:cpu_usage:percent
+        expr: |
+          100 * max by (name) (rate(container_cpu_usage_seconds_total{name!=""}[2m]))
+          / on (name) (
+              (max by (name) (container_spec_cpu_quota{name!=""} / container_spec_cpu_period{name!=""}) > 0)
+            or
+              (max by (name) (container_spec_cpu_quota{name!=""}) * 0 + scalar(machine_cpu_cores))
+          )
+
+      # Working-set memory of a container, as a percentage of its memory limit when one is
+      # set (deploy.resources.limits.memory), otherwise of the host's total memory.
+      - record: container:memory_usage:percent
+        expr: |
+          100 * max by (name) (container_memory_working_set_bytes{name!=""})
+          / on (name) (
+              (max by (name) (container_spec_memory_limit_bytes{name!=""}) > 0 < 1e15)
+            or
+              (max by (name) (container_spec_memory_limit_bytes{name!=""}) * 0 + scalar(node_memory_MemTotal_bytes))
+          )
+
+      - record: node:cpu_usage:percent
+        expr: 100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[2m])))
+
+      - record: node:memory_usage:percent
+        expr: 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)

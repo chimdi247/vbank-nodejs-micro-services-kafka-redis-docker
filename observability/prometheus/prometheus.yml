@@ -1,0 +1,90 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: docker
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # ---- Prometheus itself ------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ---- application telemetry (OpenTelemetry SDK metrics, exposed by the collector)
+  - job_name: otel-collector-app-metrics
+    honor_labels: true
+    static_configs:
+      - targets: ['otel-collector:8889']
+
+  # ---- containers and host ----------------------------------------------------
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # ---- infrastructure exporters -----------------------------------------------
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: kafka
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  # ---- observability stack self-monitoring ------------------------------------
+  - job_name: grafana
+    static_configs:
+      - targets: ['grafana:3000']
+
+  - job_name: loki
+    static_configs:
+      - targets: ['loki:3100']
+
+  - job_name: tempo
+    static_configs:
+      - targets: ['tempo:3200']
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']
+
+  # ---- uptime / availability: HTTP probes against every VBank service ---------
+  - job_name: blackbox-services
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ['http://api-gateway:3000/health']
+        labels: { service: api-gateway }
+      - targets: ['http://auth-service:3000/health']
+        labels: { service: auth-service }
+      - targets: ['http://account-service:3000/health']
+        labels: { service: account-service }
+      - targets: ['http://transaction-service:3000/health']
+        labels: { service: transaction-service }
+      - targets: ['http://mock-central-bank-service:3000/health']
+        labels: { service: mock-central-bank-service }
+      - targets: ['http://frontend:80/healthz']
+        labels: { service: frontend }
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

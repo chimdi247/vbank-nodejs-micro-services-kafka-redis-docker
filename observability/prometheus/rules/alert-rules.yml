@@ -1,0 +1,119 @@
+groups:
+  # ---------------------------------------------------------------------------
+  # CPU / memory above 50 %  ->  e-mail through Alertmanager
+  # ---------------------------------------------------------------------------
+  - name: vbank-resource-alerts
+    rules:
+      - alert: ContainerHighCpu
+        expr: container:cpu_usage:percent > 50
+        for: 2m
+        labels:
+          severity: warning
+          scope: container
+        annotations:
+          summary: "High CPU on container {{ $labels.name }}"
+          description: "Container {{ $labels.name }} has used {{ $value | printf \"%.1f\" }}% CPU (threshold 50%) for more than 2 minutes."
+
+      - alert: ContainerHighMemory
+        expr: container:memory_usage:percent > 50
+        for: 2m
+        labels:
+          severity: warning
+          scope: container
+        annotations:
+          summary: "High memory on container {{ $labels.name }}"
+          description: "Container {{ $labels.name }} is using {{ $value | printf \"%.1f\" }}% of its memory (threshold 50%) for more than 2 minutes."
+
+      - alert: NodeHighCpu
+        expr: node:cpu_usage:percent > 50
+        for: 2m
+        labels:
+          severity: warning
+          scope: node
+        annotations:
+          summary: "High CPU on the Docker host"
+          description: "Node CPU utilisation is {{ $value | printf \"%.1f\" }}% (threshold 50%) for more than 2 minutes."
+
+      - alert: NodeHighMemory
+        expr: node:memory_usage:percent > 50
+        for: 2m
+        labels:
+          severity: warning
+          scope: node
+        annotations:
+          summary: "High memory on the Docker host"
+          description: "Node memory utilisation is {{ $value | printf \"%.1f\" }}% (threshold 50%) for more than 2 minutes."
+
+  # ---------------------------------------------------------------------------
+  # Service level alerts
+  # ---------------------------------------------------------------------------
+  - name: vbank-service-alerts
+    rules:
+      - alert: ServiceDown
+        expr: probe_success{job="blackbox-services"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} is down"
+          description: "The /health probe of {{ $labels.service }} has been failing for more than 1 minute."
+
+      - alert: HighHttpErrorRate
+        expr: |
+          sum by (service) (rate(traces_spanmetrics_calls_total{span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_ERROR"}[5m]))
+          /
+          sum by (service) (rate(traces_spanmetrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "5xx error ratio above 5% on {{ $labels.service }}"
+          description: "{{ $labels.service }} returned server errors for {{ $value | humanizePercentage }} of requests over the last 5 minutes."
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, service) (rate(traces_spanmetrics_latency_bucket{span_kind="SPAN_KIND_SERVER"}[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s on {{ $labels.service }}"
+          description: "p95 request latency of {{ $labels.service }} is {{ $value | printf \"%.2f\" }}s."
+
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag on {{ $labels.topic }}"
+          description: "Consumer group {{ $labels.consumergroup }} is {{ $value }} messages behind on {{ $labels.topic }}."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is unreachable"
+          description: "postgres-exporter cannot connect to the database."
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is unreachable"
+          description: "redis-exporter cannot connect to Redis."
+
+      - alert: ContainerRestarted
+        expr: changes(container_start_time_seconds{name!=""}[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Container {{ $labels.name }} restarted"
+          description: "Container {{ $labels.name }} was (re)started within the last 10 minutes."

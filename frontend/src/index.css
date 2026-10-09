@@ -1,0 +1,62 @@
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource-variable/instrument-sans";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* canvas: a cool mineral grey; ink: deep lagoon green; marigold is reserved for the passbook binding */
+    --background: 105 12% 95%;
+    --foreground: 177 45% 13%;
+    --card: 0 0% 100%;
+    --card-foreground: 177 45% 13%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 177 45% 13%;
+    --primary: 174 76% 24%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 140 14% 91%;
+    --secondary-foreground: 177 45% 13%;
+    --muted: 120 10% 92%;
+    --muted-foreground: 176 12% 36%;
+    --accent: 140 14% 91%;
+    --accent-foreground: 177 45% 13%;
+    --destructive: 17 88% 40%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 60% 28%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 90% 38%;
+    --warning-foreground: 0 0% 100%;
+    --marigold: 42 88% 58%;
+    --ink: 177 45% 10%;
+    --border: 140 10% 85%;
+    --input: 140 10% 80%;
+    --ring: 174 76% 24%;
+    --radius: 0.625rem;
+  }
+
+  * { @apply border-border; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "ss01", "cv11";
+  }
+  h1, h2, h3 { @apply font-display tracking-tight; }
+  :focus-visible { @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background; }
+}
+
+@layer utilities {
+  .tabular { font-variant-numeric: tabular-nums lining-nums; }
+}
+
+/* Login page: the ledger lines slide in one after another, once. */
+@keyframes ledger-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.ledger-row { opacity: 0; animation: ledger-in 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) forwards; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ledger-row { animation: none; opacity: 1; }
+}
