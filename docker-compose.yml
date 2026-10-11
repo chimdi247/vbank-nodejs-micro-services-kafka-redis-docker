@@ -542,3 +542,4 @@ volumes:
   tempo_data:
   grafana_data:
   alertmanager_data:
+  promtail_positions:  
