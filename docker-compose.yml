@@ -419,7 +419,7 @@ services:
       - "1025:1025"   # SMTP
 
   grafana:
-    image: grafana/grafana:11.6.0
+    image: grafana/grafana:latest
     container_name: grafana
     restart: unless-stopped
     environment:
